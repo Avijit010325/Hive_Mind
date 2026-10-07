@@ -1,0 +1,124 @@
+# HiveMind: `cp .env.example .env`, fill in two keys, `docker compose up -d`.
+name: hivemind
+
+x-app: &app
+  build: .
+  image: hivemind:latest
+  restart: unless-stopped
+  environment: &app-env
+    # Defaults to the bundled Postgres; set DATABASE_URL to use a hosted one (Neon, Supabase, RDS).
+    DATABASE_URL: ${DATABASE_URL:-postgresql://hivemind:${POSTGRES_PASSWORD:-hivemind}@db:5432/hivemind}
+    GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    LLM_MODEL: ${LLM_MODEL:-gemma-3-27b-it}
+    LLM_BASE_URL: ${LLM_BASE_URL:-}
+    LLM_THINKING_TOKENS: ${LLM_THINKING_TOKENS:-}
+    LLM_API_KEY: ${LLM_API_KEY:-}
+    TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+    TELEGRAM_API_BASE: ${TELEGRAM_API_BASE:-https://api.telegram.org}
+    PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8000}
+    SECRET_KEY: ${SECRET_KEY:-}
+    ALLOW_SIGNUPS: ${ALLOW_SIGNUPS:-true}
+    MAX_AGENTS_PER_USER: ${MAX_AGENTS_PER_USER:-12}
+    TOOLS_ENABLED: ${TOOLS_ENABLED:-true}
+    FIRECRAWL_API_KEY: ${FIRECRAWL_API_KEY:-}
+    FIRECRAWL_API_URL: ${FIRECRAWL_API_URL:-}
+    MAX_TOOL_STEPS: ${MAX_TOOL_STEPS:-}
+    SANDBOX_URL: http://sandbox:7000
+  # `sandbox` is the only network the sandbox container is on; the database is not on it.
+  networks: [default, sandbox]
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: hivemind
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hivemind}
+      POSTGRES_DB: hivemind
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hivemind -d hivemind"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # FastAPI. Not published: the browser reaches it through the frontend's /api proxy.
+  api:
+    <<: *app
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # The shared Linux computer agents run commands in and serve previews from.
+  # Unprivileged, resource-capped, and unable to reach the database.
+  sandbox:
+    build: ./sandbox
+    image: hivemind-sandbox:latest
+    restart: unless-stopped
+    init: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: ${SANDBOX_MEMORY:-2g}
+    cpus: ${SANDBOX_CPUS:-2}
+    pids_limit: 512
+    volumes:
+      - sandbox-data:/workspace
+    networks: [sandbox]
+
+  # Next.js dashboard and landing page.
+  web:
+    build: ./frontend
+    image: hivemind-web:latest
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8000}:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # Long-polls Telegram, so no public URL or webhook is required.
+  bot:
+    <<: *app
+    command: ["python", "-m", "app.bot"]
+    healthcheck:
+      disable: true
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # Optional: run Gemma locally instead of Google AI Studio.
+  #   docker compose --profile local up -d
+  # with LLM_BASE_URL=http://ollama:11434/v1 and LLM_MODEL=gemma3:4b in .env
+  ollama:
+    profiles: ["local"]
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    environment:
+      OLLAMA_CONTEXT_LENGTH: "8192"
+    volumes:
+      - ollama-data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  ollama-pull:
+    profiles: ["local"]
+    image: ollama/ollama:latest
+    restart: "no"
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["ollama", "pull", "${LLM_MODEL:-gemma3:4b}"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+
+networks:
+  sandbox:
+
+volumes:
+  db-data:
+  sandbox-data:
+  ollama-data:
